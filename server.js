@@ -169,8 +169,10 @@ async function createGhlContact(prospect, locationId, token, campaign) {
   const firstName = prospect.firstName || personal.firstName || '';
   const lastName = prospect.lastName || personal.lastName || '';
   const email = prospect.email || personal.email || '';
-  const phone = prospect.homePhone || prospect.cellPhone || prospect.workPhone || 
-                personal.homePhone || personal.cellPhone || personal.workPhone || '';
+  // ABC uses primaryPhone and mobilePhone in the personal object
+  const phone = personal.primaryPhone || personal.mobilePhone || 
+                prospect.primaryPhone || prospect.mobilePhone ||
+                prospect.homePhone || prospect.cellPhone || '';
   const memberId = prospect.memberId || prospect.id || '';
   
   // Must have at least email or phone to create contact
