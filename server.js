@@ -36,8 +36,8 @@ const ABC_ID_FIELD_KEY = 'abc_member_id';
 // In-memory tracking of synced members (resets on restart)
 const syncedMemberIds = new Set();
 
-// Polling interval (15 seconds)
-const POLL_INTERVAL = 15000;
+// Polling interval (60 seconds to avoid rate limits)
+const POLL_INTERVAL = 60000;
 
 // Get today's date in YYYY-MM-DD format
 function getTodayDate() {
@@ -59,9 +59,8 @@ async function getAbcProspects(clubNumber) {
           'app_key': ABC_APP_KEY
         },
         params: {
-          creationDateRangeStart: today,
-          creationDateRangeEnd: today,
-          type: 'Prospect'
+          joinStatus: 'Prospect',
+          createdTimestampRange: today
         }
       }
     );
@@ -76,9 +75,13 @@ async function getAbcProspects(clubNumber) {
 // Filter prospects by campaign and entry source
 function filterProspects(prospects) {
   return prospects.filter(prospect => {
-    // Check entry source
-    const entrySource = prospect.agreementEntrySource;
-    const entrySourceReport = prospect.agreementEntrySourceReportName;
+    // Check entry source - look in multiple possible locations
+    const entrySource = prospect.agreementEntrySource || 
+                        prospect.agreement?.agreementEntrySource ||
+                        prospect.agreement?.entrySource;
+    const entrySourceReport = prospect.agreementEntrySourceReportName || 
+                              prospect.agreement?.agreementEntrySourceReportName ||
+                              prospect.agreement?.entrySourceReportName;
     
     const isValidEntrySource = 
       entrySource === 'DataTrak Fast Add' || 
@@ -86,8 +89,11 @@ function filterProspects(prospects) {
     
     if (!isValidEntrySource) return false;
     
-    // Check campaign
-    const campaign = prospect.campaign || prospect.campaignName;
+    // Check campaign - look in multiple possible locations
+    const campaign = prospect.campaign || 
+                     prospect.campaignName || 
+                     prospect.agreement?.campaign ||
+                     prospect.agreement?.campaignName;
     const isValidCampaign = TARGET_CAMPAIGNS.includes(campaign);
     
     return isValidCampaign;
@@ -158,17 +164,26 @@ async function searchGhlContactByAbcId(abcId, locationId, token) {
 async function createGhlContact(prospect, locationId, token, campaign) {
   const tag = CAMPAIGN_TAGS[campaign];
   
+  // Get personal info - check nested structure
+  const personal = prospect.personal || {};
+  const firstName = prospect.firstName || personal.firstName || '';
+  const lastName = prospect.lastName || personal.lastName || '';
+  const email = prospect.email || personal.email || '';
+  const phone = prospect.homePhone || prospect.cellPhone || prospect.workPhone || 
+                personal.homePhone || personal.cellPhone || personal.workPhone || '';
+  const memberId = prospect.memberId || prospect.id || '';
+  
   const contactData = {
     locationId: locationId,
-    firstName: prospect.firstName || '',
-    lastName: prospect.lastName || '',
-    email: prospect.email || '',
-    phone: prospect.homePhone || prospect.cellPhone || prospect.workPhone || '',
+    firstName: firstName,
+    lastName: lastName,
+    email: email,
+    phone: phone,
     tags: tag ? [tag] : [],
     customFields: [
       {
         key: ABC_ID_FIELD_KEY,
-        value: prospect.memberId?.toString() || ''
+        value: memberId.toString()
       }
     ]
   };
@@ -215,8 +230,9 @@ async function syncClub(clubNumber) {
   console.log(`[SYNC] ${filteredProspects.length} prospects match criteria`);
   
   for (const prospect of filteredProspects) {
-    const memberId = prospect.memberId;
-    const campaign = prospect.campaign || prospect.campaignName;
+    const memberId = prospect.memberId || prospect.id;
+    const campaign = prospect.campaign || prospect.campaignName || 
+                     prospect.agreement?.campaign || prospect.agreement?.campaignName;
     
     // Skip if already synced this session
     if (syncedMemberIds.has(memberId)) {
@@ -224,10 +240,13 @@ async function syncClub(clubNumber) {
       continue;
     }
     
+    // Get email for duplicate check
+    const email = prospect.email || prospect.personal?.email;
+    
     // Check for duplicate by email
-    if (prospect.email) {
+    if (email) {
       const existingByEmail = await searchGhlContactByEmail(
-        prospect.email, 
+        email, 
         ghlLocationId, 
         ghlToken
       );
@@ -270,6 +289,8 @@ async function pollAllClubs() {
   
   for (const clubNumber of Object.keys(LOCATIONS)) {
     await syncClub(clubNumber);
+    // Add delay between clubs to avoid rate limits
+    await new Promise(resolve => setTimeout(resolve, 2000));
   }
   
   console.log(`[POLL] Poll cycle complete. Synced members tracked: ${syncedMemberIds.size}`);
@@ -297,6 +318,7 @@ app.get('/', (req, res) => {
   res.json({
     status: 'running',
     syncedCount: syncedMemberIds.size,
+    pollInterval: `${POLL_INTERVAL / 1000} seconds`,
     lastPoll: new Date().toISOString(),
     locations: Object.keys(LOCATIONS)
   });
@@ -308,6 +330,86 @@ app.get('/trigger', async (req, res) => {
   res.json({ 
     status: 'Poll triggered',
     syncedCount: syncedMemberIds.size 
+  });
+});
+
+// DEBUG: See raw prospect data structure
+app.get('/debug/:clubNumber', async (req, res) => {
+  const clubNumber = req.params.clubNumber;
+  console.log(`[DEBUG] Fetching sample prospects for club ${clubNumber}`);
+  
+  const prospects = await getAbcProspects(clubNumber);
+  
+  // Return first 3 prospects with full structure
+  const samples = prospects.slice(0, 3).map(p => ({
+    // Top level fields
+    memberId: p.memberId,
+    id: p.id,
+    firstName: p.firstName,
+    lastName: p.lastName,
+    email: p.email,
+    campaign: p.campaign,
+    campaignName: p.campaignName,
+    agreementEntrySource: p.agreementEntrySource,
+    agreementEntrySourceReportName: p.agreementEntrySourceReportName,
+    // Nested personal
+    personal: p.personal,
+    // Nested agreement
+    agreement: p.agreement,
+    // All keys at top level
+    allTopLevelKeys: Object.keys(p)
+  }));
+  
+  res.json({
+    totalProspects: prospects.length,
+    sampleCount: samples.length,
+    samples: samples
+  });
+});
+
+// DEBUG: Test filter on actual data
+app.get('/debug-filter/:clubNumber', async (req, res) => {
+  const clubNumber = req.params.clubNumber;
+  console.log(`[DEBUG] Testing filter for club ${clubNumber}`);
+  
+  const prospects = await getAbcProspects(clubNumber);
+  
+  // Check each prospect and show why it passed or failed
+  const analysis = prospects.slice(0, 20).map(p => {
+    const entrySource = p.agreementEntrySource || 
+                        p.agreement?.agreementEntrySource ||
+                        p.agreement?.entrySource;
+    const entrySourceReport = p.agreementEntrySourceReportName || 
+                              p.agreement?.agreementEntrySourceReportName ||
+                              p.agreement?.entrySourceReportName;
+    const campaign = p.campaign || 
+                     p.campaignName || 
+                     p.agreement?.campaign ||
+                     p.agreement?.campaignName;
+    
+    const isValidEntrySource = entrySource === 'DataTrak Fast Add' || entrySourceReport === 'Fast Add';
+    const isValidCampaign = TARGET_CAMPAIGNS.includes(campaign);
+    
+    return {
+      memberId: p.memberId || p.id,
+      name: `${p.firstName || p.personal?.firstName || ''} ${p.lastName || p.personal?.lastName || ''}`,
+      entrySource,
+      entrySourceReport,
+      campaign,
+      passesEntrySource: isValidEntrySource,
+      passesCampaign: isValidCampaign,
+      wouldSync: isValidEntrySource && isValidCampaign
+    };
+  });
+  
+  const filtered = filterProspects(prospects);
+  
+  res.json({
+    totalProspects: prospects.length,
+    matchingFilter: filtered.length,
+    targetCampaigns: TARGET_CAMPAIGNS,
+    requiredEntrySource: 'DataTrak Fast Add / Fast Add',
+    analysis: analysis
   });
 });
 
