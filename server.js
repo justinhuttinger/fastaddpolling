@@ -173,11 +173,17 @@ async function createGhlContact(prospect, locationId, token, campaign) {
                 personal.homePhone || personal.cellPhone || personal.workPhone || '';
   const memberId = prospect.memberId || prospect.id || '';
   
+  // Must have at least email or phone to create contact
+  if (!email && !phone) {
+    console.log(`[GHL] Skipping contact creation - no email or phone for ${firstName} ${lastName} (${memberId})`);
+    return null;
+  }
+  
+  // Build contact data - only include email if it's valid
   const contactData = {
     locationId: locationId,
     firstName: firstName,
     lastName: lastName,
-    email: email,
     phone: phone,
     tags: tag ? [tag] : [],
     customFields: [
@@ -187,6 +193,11 @@ async function createGhlContact(prospect, locationId, token, campaign) {
       }
     ]
   };
+  
+  // Only add email if it looks valid
+  if (email && email.includes('@')) {
+    contactData.email = email;
+  }
   
   try {
     const response = await axios.post(
@@ -201,7 +212,7 @@ async function createGhlContact(prospect, locationId, token, campaign) {
       }
     );
     
-    console.log(`[GHL] Created contact: ${contactData.firstName} ${contactData.lastName} (${contactData.email}) with tag: ${tag}`);
+    console.log(`[GHL] Created contact: ${contactData.firstName} ${contactData.lastName} (${contactData.email || 'no email'}, ${contactData.phone || 'no phone'}) with tag: ${tag}`);
     return response.data;
   } catch (error) {
     console.error(`[GHL] Error creating contact:`, error.response?.data || error.message);
