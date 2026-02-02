@@ -54,9 +54,9 @@ async function getAbcProspects(clubNumber) {
       `${ABC_API_BASE}/${clubNumber}/members`,
       {
         headers: {
-          'app-id': ABC_APP_ID,
-          'app-key': ABC_APP_KEY,
-          'Content-Type': 'application/json'
+          'accept': 'application/json',
+          'app_id': ABC_APP_ID,
+          'app_key': ABC_APP_KEY
         },
         params: {
           creationDateRangeStart: today,
