@@ -36,6 +36,20 @@ const ABC_ID_FIELD_KEY = 'abc_member_id';
 // In-memory tracking of synced members (resets on restart)
 const syncedMemberIds = new Set();
 
+// ═══════════════════════════════════════════
+// SWIM POS CONFIG (Club 31600 - Clackamas)
+// ═══════════════════════════════════════════
+const SWIM_CLUB = '31600';
+const SWIM_PROFIT_CENTERS = [
+  'Swim Club',
+  'Group Swim Lessons',
+  'Private Swim Lessons'
+];
+const SWIM_TAG = 'swim purchased';
+
+// In-memory tracking of synced swim transaction IDs (resets on restart)
+const syncedSwimTransactionIds = new Set();
+
 // Polling interval (60 seconds to avoid rate limits)
 const POLL_INTERVAL = 60000;
 
@@ -44,6 +58,10 @@ function getTodayDate() {
   const today = new Date();
   return today.toISOString().split('T')[0];
 }
+
+// ═══════════════════════════════════════════
+// EXISTING PROSPECT SYNC FUNCTIONS
+// ═══════════════════════════════════════════
 
 // ABC API: Get members/prospects for a club
 async function getAbcProspects(clubNumber) {
@@ -296,20 +314,269 @@ async function syncClub(clubNumber) {
   }
 }
 
+// ═══════════════════════════════════════════
+// SWIM POS SYNC FUNCTIONS (Club 31600 only)
+// ═══════════════════════════════════════════
+
+// ABC API: Get POS Transactions
+async function getPosTransactions(clubNumber) {
+  const today = getTodayDate();
+
+  try {
+    const response = await axios.get(
+      `${ABC_API_BASE}/${clubNumber}/clubs/transactions/pos`,
+      {
+        headers: {
+          'accept': 'application/json',
+          'app_id': ABC_APP_ID,
+          'app_key': ABC_APP_KEY
+        },
+        params: {
+          transactionTimestampRange: today
+        }
+      }
+    );
+
+    return response.data;
+  } catch (error) {
+    console.error(`[SWIM] Error fetching POS transactions for club ${clubNumber}:`, error.response?.data || error.message);
+    return {};
+  }
+}
+
+// Extract transactions from ABC POS response (nested under clubs[0].transactions)
+function extractTransactions(data) {
+  try {
+    const clubs = data.clubs || [];
+    if (clubs.length === 0) return [];
+    const transactions = clubs[0].transactions || [];
+    return Array.isArray(transactions) ? transactions : [];
+  } catch (e) {
+    console.error('[SWIM] Error extracting transactions:', e.message);
+    return [];
+  }
+}
+
+// Extract items from a transaction (nested under items.item)
+function extractItems(transaction) {
+  const itemsWrapper = transaction.items || {};
+  const items = itemsWrapper.item || [];
+  return Array.isArray(items) ? items : [items];
+}
+
+// ABC API: Get member by ID
+async function getAbcMember(clubNumber, memberId) {
+  try {
+    const response = await axios.get(
+      `${ABC_API_BASE}/${clubNumber}/members/${memberId}`,
+      {
+        headers: {
+          'accept': 'application/json',
+          'app_id': ABC_APP_ID,
+          'app_key': ABC_APP_KEY
+        }
+      }
+    );
+
+    const members = response.data.members || [];
+    return members[0] || null;
+  } catch (error) {
+    console.error(`[SWIM] Error fetching member ${memberId}:`, error.response?.data || error.message);
+    return null;
+  }
+}
+
+// GHL API: Add tag to existing contact
+async function addTagToGhlContact(contactId, tag, token) {
+  try {
+    const response = await axios.put(
+      `https://services.leadconnectorhq.com/contacts/${contactId}`,
+      {
+        tags: [tag]
+      },
+      {
+        headers: {
+          'Authorization': `Bearer ${token}`,
+          'Version': '2021-07-28',
+          'Content-Type': 'application/json'
+        }
+      }
+    );
+
+    console.log(`[SWIM] Added tag "${tag}" to existing contact ${contactId}`);
+    return response.data;
+  } catch (error) {
+    console.error(`[SWIM] Error adding tag to contact ${contactId}:`, error.response?.data || error.message);
+    return null;
+  }
+}
+
+// GHL API: Create contact for swim sale
+async function createGhlSwimContact(member, locationId, token) {
+  const personal = member.personal || {};
+  const firstName = personal.firstName || '';
+  const lastName = personal.lastName || '';
+  const email = personal.email || '';
+  const phone = personal.primaryPhone || personal.mobilePhone || '';
+  const memberId = member.memberId || '';
+
+  if (!email && !phone) {
+    console.log(`[SWIM] Skipping contact creation - no email or phone for ${firstName} ${lastName} (${memberId})`);
+    return null;
+  }
+
+  const contactData = {
+    locationId: locationId,
+    firstName: firstName,
+    lastName: lastName,
+    phone: phone,
+    tags: [SWIM_TAG],
+    customFields: [
+      {
+        key: ABC_ID_FIELD_KEY,
+        value: memberId.toString()
+      }
+    ]
+  };
+
+  if (email && email.includes('@')) {
+    contactData.email = email;
+  }
+
+  try {
+    const response = await axios.post(
+      'https://services.leadconnectorhq.com/contacts/',
+      contactData,
+      {
+        headers: {
+          'Authorization': `Bearer ${token}`,
+          'Version': '2021-07-28',
+          'Content-Type': 'application/json'
+        }
+      }
+    );
+
+    console.log(`[SWIM] Created contact: ${firstName} ${lastName} (${email || 'no email'}) with tag: ${SWIM_TAG}`);
+    return response.data;
+  } catch (error) {
+    console.error(`[SWIM] Error creating swim contact:`, error.response?.data || error.message);
+    return null;
+  }
+}
+
+// Main swim sync function
+async function syncSwimSales() {
+  const locationConfig = LOCATIONS[SWIM_CLUB];
+  if (!locationConfig) {
+    console.error(`[SWIM] No configuration found for club ${SWIM_CLUB}`);
+    return;
+  }
+
+  const { ghlLocationId, ghlToken } = locationConfig;
+
+  console.log(`[SWIM] Polling POS transactions for club ${SWIM_CLUB}...`);
+
+  // Get today's POS transactions
+  const data = await getPosTransactions(SWIM_CLUB);
+  const transactions = extractTransactions(data);
+  console.log(`[SWIM] Found ${transactions.length} total POS transactions for today`);
+
+  let swimCount = 0;
+  let skippedReturns = 0;
+  let skippedAlreadySynced = 0;
+  let created = 0;
+  let tagged = 0;
+
+  for (const tx of transactions) {
+    // Skip returns
+    if (tx.return === 'true' || tx.return === true) {
+      const items = extractItems(tx);
+      const hasSwim = items.some(item => SWIM_PROFIT_CENTERS.includes(item.profitCenter));
+      if (hasSwim) skippedReturns++;
+      continue;
+    }
+
+    // Check for swim items
+    const items = extractItems(tx);
+    const swimItems = items.filter(item =>
+      SWIM_PROFIT_CENTERS.includes(item.profitCenter)
+    );
+
+    if (swimItems.length === 0) continue;
+
+    swimCount++;
+    const txId = tx.transactionId;
+
+    // Skip if already synced this session
+    if (syncedSwimTransactionIds.has(txId)) {
+      skippedAlreadySynced++;
+      continue;
+    }
+
+    // Look up member details from ABC
+    const member = await getAbcMember(SWIM_CLUB, tx.memberId);
+    if (!member) {
+      console.error(`[SWIM] Could not fetch member ${tx.memberId} - skipping`);
+      syncedSwimTransactionIds.add(txId);
+      continue;
+    }
+
+    const personal = member.personal || {};
+    const email = personal.email || '';
+    const memberId = member.memberId || '';
+
+    // Check for existing contact by email
+    let existingContact = null;
+    if (email) {
+      existingContact = await searchGhlContactByEmail(email, ghlLocationId, ghlToken);
+    }
+
+    // If not found by email, check by ABC ID
+    if (!existingContact) {
+      existingContact = await searchGhlContactByAbcId(memberId, ghlLocationId, ghlToken);
+    }
+
+    if (existingContact) {
+      // Contact exists - just add the swim tag
+      await addTagToGhlContact(existingContact.id, SWIM_TAG, ghlToken);
+      tagged++;
+    } else {
+      // Contact doesn't exist - create with swim tag
+      await createGhlSwimContact(member, ghlLocationId, ghlToken);
+      created++;
+    }
+
+    syncedSwimTransactionIds.add(txId);
+
+    // Small delay to avoid rate limiting
+    await new Promise(resolve => setTimeout(resolve, 300));
+  }
+
+  console.log(`[SWIM] Summary: ${swimCount} swim transactions found, ${created} contacts created, ${tagged} contacts tagged, ${skippedReturns} returns skipped, ${skippedAlreadySynced} already synced`);
+}
+
+// ═══════════════════════════════════════════
+// MAIN POLLING FUNCTION
+// ═══════════════════════════════════════════
+
 // Main polling function
 async function pollAllClubs() {
   console.log(`\n[POLL] Starting poll cycle at ${new Date().toISOString()}`);
   
+  // Existing prospect sync for all clubs
   for (const clubNumber of Object.keys(LOCATIONS)) {
     await syncClub(clubNumber);
     // Add delay between clubs to avoid rate limits
     await new Promise(resolve => setTimeout(resolve, 2000));
   }
+
+  // Swim POS sync for club 31600
+  await syncSwimSales();
   
-  console.log(`[POLL] Poll cycle complete. Synced members tracked: ${syncedMemberIds.size}`);
+  console.log(`[POLL] Poll cycle complete. Synced prospects: ${syncedMemberIds.size} | Synced swim txns: ${syncedSwimTransactionIds.size}`);
 }
 
-// Clear synced IDs at midnight (new day = new prospects)
+// Clear synced IDs at midnight (new day = new prospects/transactions)
 function scheduleMidnightReset() {
   const now = new Date();
   const midnight = new Date(now);
@@ -318,22 +585,30 @@ function scheduleMidnightReset() {
   const msUntilMidnight = midnight - now;
   
   setTimeout(() => {
-    console.log('[RESET] Midnight - clearing synced member IDs');
+    console.log('[RESET] Midnight - clearing synced IDs');
     syncedMemberIds.clear();
+    syncedSwimTransactionIds.clear();
     scheduleMidnightReset(); // Schedule next reset
   }, msUntilMidnight);
   
   console.log(`[RESET] Scheduled midnight reset in ${Math.round(msUntilMidnight / 1000 / 60)} minutes`);
 }
 
+// ═══════════════════════════════════════════
+// ENDPOINTS
+// ═══════════════════════════════════════════
+
 // Health check endpoint
 app.get('/', (req, res) => {
   res.json({
     status: 'running',
-    syncedCount: syncedMemberIds.size,
+    syncedProspectCount: syncedMemberIds.size,
+    syncedSwimTxCount: syncedSwimTransactionIds.size,
     pollInterval: `${POLL_INTERVAL / 1000} seconds`,
     lastPoll: new Date().toISOString(),
-    locations: Object.keys(LOCATIONS)
+    locations: Object.keys(LOCATIONS),
+    swimClub: SWIM_CLUB,
+    swimProfitCenters: SWIM_PROFIT_CENTERS
   });
 });
 
@@ -342,7 +617,17 @@ app.get('/trigger', async (req, res) => {
   await pollAllClubs();
   res.json({ 
     status: 'Poll triggered',
-    syncedCount: syncedMemberIds.size 
+    syncedProspectCount: syncedMemberIds.size,
+    syncedSwimTxCount: syncedSwimTransactionIds.size
+  });
+});
+
+// Manual trigger for swim only
+app.get('/trigger-swim', async (req, res) => {
+  await syncSwimSales();
+  res.json({
+    status: 'Swim sync triggered',
+    syncedSwimTxCount: syncedSwimTransactionIds.size
   });
 });
 
@@ -426,11 +711,62 @@ app.get('/debug-filter/:clubNumber', async (req, res) => {
   });
 });
 
+// DEBUG: See today's swim POS transactions
+app.get('/debug-swim', async (req, res) => {
+  console.log(`[DEBUG] Fetching swim POS data for club ${SWIM_CLUB}`);
+
+  const data = await getPosTransactions(SWIM_CLUB);
+  const transactions = extractTransactions(data);
+
+  const swimSales = [];
+  let skippedReturns = 0;
+
+  transactions.forEach(tx => {
+    if (tx.return === 'true' || tx.return === true) {
+      const items = extractItems(tx);
+      if (items.some(item => SWIM_PROFIT_CENTERS.includes(item.profitCenter))) skippedReturns++;
+      return;
+    }
+
+    const items = extractItems(tx);
+    const swimItems = items.filter(item =>
+      SWIM_PROFIT_CENTERS.includes(item.profitCenter)
+    );
+
+    if (swimItems.length > 0) {
+      swimSales.push({
+        transactionId: tx.transactionId,
+        transactionTimestamp: tx.transactionTimestamp,
+        memberId: tx.memberId,
+        alreadySynced: syncedSwimTransactionIds.has(tx.transactionId),
+        swimItems: swimItems.map(item => ({
+          name: item.name,
+          profitCenter: item.profitCenter,
+          unitPrice: item.unitPrice,
+          quantity: item.quantity,
+          subtotal: item.subtotal
+        }))
+      });
+    }
+  });
+
+  res.json({
+    club: SWIM_CLUB,
+    date: getTodayDate(),
+    totalTransactions: transactions.length,
+    swimTransactionsFound: swimSales.length,
+    returnsSkipped: skippedReturns,
+    syncedSwimTxCount: syncedSwimTransactionIds.size,
+    transactions: swimSales
+  });
+});
+
 // Start server
 app.listen(PORT, () => {
-  console.log(`[SERVER] ABC-GHL Prospect Sync running on port ${PORT}`);
+  console.log(`[SERVER] ABC-GHL Prospect + Swim Sync running on port ${PORT}`);
   console.log(`[SERVER] Polling every ${POLL_INTERVAL / 1000} seconds`);
-  console.log(`[SERVER] Monitoring clubs: ${Object.keys(LOCATIONS).join(', ')}`);
+  console.log(`[SERVER] Prospect sync clubs: ${Object.keys(LOCATIONS).join(', ')}`);
+  console.log(`[SERVER] Swim POS sync club: ${SWIM_CLUB} (${SWIM_PROFIT_CENTERS.join(', ')})`);
   
   // Schedule midnight reset
   scheduleMidnightReset();
