@@ -1,7 +1,7 @@
 {
   "name": "abc-ghl-prospect-sync",
-  "version": "1.0.0",
-  "description": "Polls ABC Financial for new prospects and syncs to GoHighLevel",
+  "version": "1.1.0",
+  "description": "Polls ABC Financial for new prospects and swim POS sales, syncs to GoHighLevel",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
