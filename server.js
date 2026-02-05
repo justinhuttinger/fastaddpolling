@@ -513,10 +513,11 @@ async function syncSwimSales() {
       continue;
     }
 
-    // Look up member details from ABC
-    const member = await getAbcMember(SWIM_CLUB, tx.memberId);
+    // Look up member details from ABC (use member's homeClub, not the POS club)
+    const memberHomeClub = tx.homeClub || SWIM_CLUB;
+    const member = await getAbcMember(memberHomeClub, tx.memberId);
     if (!member) {
-      console.error(`[SWIM] Could not fetch member ${tx.memberId} - skipping`);
+      console.error(`[SWIM] Could not fetch member ${tx.memberId} from club ${memberHomeClub} - skipping`);
       syncedSwimTransactionIds.add(txId);
       continue;
     }
